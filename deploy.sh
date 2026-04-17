@@ -123,9 +123,65 @@ step_prepare_log() {
   chown "$RUN_USER:$RUN_USER" "$LOG_FILE"
 }
 
+step_write_wrapper_scripts() {
+  log "写入 wrapper 脚本（run.sh / watchdog.sh）..."
+
+  # run.sh：包装 checkin.py，检测到余额变化则记录日期
+  cat >"$INSTALL_DIR/run.sh" <<EOF
+#!/usr/bin/env bash
+# 由 systemd 调用。执行签到并记录"今日是否有余额变化"
+set -o pipefail
+cd "$INSTALL_DIR"
+
+OUT=\$(/usr/bin/xvfb-run -a "$UV_BIN" run checkin.py 2>&1)
+EXIT=\$?
+echo "\$OUT"
+
+# checkin.py 在余额变化或首次运行时会输出这两个标记
+if echo "\$OUT" | grep -qE 'Balance changes detected|First run detected'; then
+  TZ=Asia/Shanghai date +%Y-%m-%d > "$INSTALL_DIR/last_balance_change.txt"
+fi
+
+exit \$EXIT
+EOF
+
+  # watchdog.sh：18:30 检查今日是否有余额变化，没有就推 Bark
+  cat >"$INSTALL_DIR/watchdog.sh" <<EOF
+#!/usr/bin/env bash
+# 由 systemd 每天北京时间 18:30 调用
+set -a; source "$INSTALL_DIR/.env"; set +a
+
+TODAY=\$(TZ=Asia/Shanghai date +%Y-%m-%d)
+LAST=\$(cat "$INSTALL_DIR/last_balance_change.txt" 2>/dev/null || echo "")
+
+if [[ "\$LAST" == "\$TODAY" ]]; then
+  echo "[\$(date)] 今日已有余额变化，跳过告警"
+  exit 0
+fi
+
+if [[ -z "\$BARK_KEY" ]]; then
+  echo "[\$(date)] 未配置 BARK_KEY，无法告警"
+  exit 0
+fi
+
+TITLE="⚠️ AnyRouter 今日未签到成功"
+BODY="北京时间 18:00 仍未检测到余额变化，请手动签到或检查 cookie"
+
+curl -s -X POST "\${BARK_SERVER:-https://api.day.app}/\${BARK_KEY}" \\
+  -H "Content-Type: application/json; charset=utf-8" \\
+  --data-raw "{\"title\":\"\$TITLE\",\"body\":\"\$BODY\",\"group\":\"AnyRouter\",\"level\":\"timeSensitive\"}"
+
+echo "[\$(date)] 已推送未签到告警"
+EOF
+
+  chmod +x "$INSTALL_DIR/run.sh" "$INSTALL_DIR/watchdog.sh"
+  chown "$RUN_USER:$RUN_USER" "$INSTALL_DIR/run.sh" "$INSTALL_DIR/watchdog.sh"
+}
+
 step_write_systemd() {
   log "写入 systemd service/timer..."
 
+  # 签到 service
   cat >/etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
 Description=AnyRouter Check-in
@@ -137,18 +193,19 @@ Type=oneshot
 User=$RUN_USER
 WorkingDirectory=$INSTALL_DIR
 EnvironmentFile=$INSTALL_DIR/.env
-ExecStart=/usr/bin/xvfb-run -a $UV_BIN run checkin.py
+ExecStart=$INSTALL_DIR/run.sh
 StandardOutput=append:$LOG_FILE
 StandardError=append:$LOG_FILE
 TimeoutStartSec=600
 EOF
 
+  # 签到 timer（北京时间每 6h）
   cat >/etc/systemd/system/${SERVICE_NAME}.timer <<EOF
 [Unit]
-Description=AnyRouter Check-in Timer (every 6h)
+Description=AnyRouter Check-in Timer (every 6h, Beijing time)
 
 [Timer]
-OnCalendar=*-*-* 00,06,12,18:00:00
+OnCalendar=*-*-* 00,06,12,18:00:00 Asia/Shanghai
 RandomizedDelaySec=300
 Persistent=true
 Unit=${SERVICE_NAME}.service
@@ -157,8 +214,38 @@ Unit=${SERVICE_NAME}.service
 WantedBy=timers.target
 EOF
 
+  # Watchdog service
+  cat >/etc/systemd/system/${SERVICE_NAME}-watchdog.service <<EOF
+[Unit]
+Description=AnyRouter Watchdog (alert if not checked in by 18:00 Beijing time)
+
+[Service]
+Type=oneshot
+User=$RUN_USER
+WorkingDirectory=$INSTALL_DIR
+EnvironmentFile=$INSTALL_DIR/.env
+ExecStart=$INSTALL_DIR/watchdog.sh
+StandardOutput=append:$LOG_FILE
+StandardError=append:$LOG_FILE
+EOF
+
+  # Watchdog timer（北京时间每天 18:30，给 18:00 签到留出完成时间）
+  cat >/etc/systemd/system/${SERVICE_NAME}-watchdog.timer <<EOF
+[Unit]
+Description=AnyRouter Watchdog Timer (daily 18:30 Beijing time)
+
+[Timer]
+OnCalendar=*-*-* 18:30:00 Asia/Shanghai
+Persistent=true
+Unit=${SERVICE_NAME}-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
   systemctl daemon-reload
   systemctl enable --now "${SERVICE_NAME}.timer"
+  systemctl enable --now "${SERVICE_NAME}-watchdog.timer"
 }
 
 step_summary() {
@@ -169,13 +256,15 @@ step_summary() {
   echo "  日志文件：$LOG_FILE"
   echo
   echo "常用命令："
-  echo "  查看下次触发： systemctl list-timers | grep $SERVICE_NAME"
-  echo "  手动跑一次：   sudo systemctl start ${SERVICE_NAME}.service"
-  echo "  查看状态：     systemctl status ${SERVICE_NAME}.service"
-  echo "  查看日志：     tail -f $LOG_FILE"
-  echo "  停止/禁用：    sudo systemctl disable --now ${SERVICE_NAME}.timer"
-  echo "  更新代码：     sudo bash $INSTALL_DIR/deploy.sh"
+  echo "  查看所有定时器： systemctl list-timers | grep $SERVICE_NAME"
+  echo "  手动跑签到：     sudo systemctl start ${SERVICE_NAME}.service"
+  echo "  手动跑 watchdog：sudo systemctl start ${SERVICE_NAME}-watchdog.service"
+  echo "  查看日志：       tail -f $LOG_FILE"
+  echo "  停止签到：       sudo systemctl disable --now ${SERVICE_NAME}.timer"
+  echo "  停止 watchdog：  sudo systemctl disable --now ${SERVICE_NAME}-watchdog.timer"
+  echo "  更新代码：       sudo bash $INSTALL_DIR/deploy.sh"
   echo
+  warn "Bark 配置：.env 里需要 BARK_KEY=xxx 和 BARK_SERVER=https://api.day.app"
   warn "别忘了去 GitHub 关掉原仓库的 Actions workflow，避免重复签到"
 }
 
@@ -188,6 +277,7 @@ main() {
   step_uv_sync
   step_prepare_env
   step_prepare_log
+  step_write_wrapper_scripts
   step_write_systemd
   step_summary
 }
