@@ -15,6 +15,16 @@ LOG_FILE="/var/log/${SERVICE_NAME}.log"
 RUN_USER="${SUDO_USER:-root}"
 RUN_HOME=$(getent passwd "$RUN_USER" | cut -d: -f6)
 
+# 国内镜像源（阿里云服务器下载极快）。要禁用镜像：USE_MIRROR=0 sudo bash deploy.sh
+USE_MIRROR="${USE_MIRROR:-1}"
+if [[ "$USE_MIRROR" == "1" ]]; then
+  UV_INDEX_URL="https://mirrors.aliyun.com/pypi/simple/"
+  PLAYWRIGHT_DOWNLOAD_HOST="https://npmmirror.com/mirrors/playwright"
+else
+  UV_INDEX_URL=""
+  PLAYWRIGHT_DOWNLOAD_HOST=""
+fi
+
 # ============ 工具函数 ============
 log()  { echo -e "\033[32m[INFO]\033[0m  $*"; }
 warn() { echo -e "\033[33m[WARN]\033[0m  $*"; }
@@ -59,14 +69,19 @@ step_clone_or_update() {
 }
 
 step_uv_sync() {
-  log "同步 Python 依赖..."
-  sudo -u "$RUN_USER" bash -c "cd '$INSTALL_DIR' && '$UV_BIN' sync"
+  log "同步 Python 依赖${USE_MIRROR:+（使用阿里云镜像）}..."
+  sudo -u "$RUN_USER" env UV_INDEX_URL="$UV_INDEX_URL" \
+    bash -c "cd '$INSTALL_DIR' && '$UV_BIN' sync"
 
-  log "安装 Playwright Chromium（含系统依赖，约需 1-2 分钟）..."
-  # playwright install --with-deps 需要 root 权限安装 apt 包
-  sudo -u "$RUN_USER" bash -c "cd '$INSTALL_DIR' && '$UV_BIN' run playwright install chromium"
+  log "安装 Playwright Chromium${USE_MIRROR:+（使用 npmmirror）}，约需 1-2 分钟..."
+  sudo -u "$RUN_USER" env \
+    UV_INDEX_URL="$UV_INDEX_URL" \
+    PLAYWRIGHT_DOWNLOAD_HOST="$PLAYWRIGHT_DOWNLOAD_HOST" \
+    bash -c "cd '$INSTALL_DIR' && '$UV_BIN' run playwright install chromium"
+
   # 系统依赖单独装，避免 uv 在非 root 下 sudo 提权问题
-  sudo -u "$RUN_USER" bash -c "cd '$INSTALL_DIR' && '$UV_BIN' run playwright install-deps chromium" || \
+  sudo -u "$RUN_USER" env UV_INDEX_URL="$UV_INDEX_URL" \
+    bash -c "cd '$INSTALL_DIR' && '$UV_BIN' run playwright install-deps chromium" || \
     warn "playwright install-deps 失败，可能需要手动补 apt 包"
 }
 
